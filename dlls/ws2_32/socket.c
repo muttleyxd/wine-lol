@@ -2233,6 +2233,7 @@ INT WINAPI WSAIoctl(SOCKET s, DWORD code, LPVOID in_buff, DWORD in_size, LPVOID 
         if (overlapped) ret = ERROR_IO_PENDING;
         if (!ret) *ret_size = sizeof(SOCKET);
         SetLastError( ret );
+        FIXME("SIO_BASE_HANDLE returning %d\n", ret ? -1 : 0);
         return ret ? -1 : 0;
     }
 

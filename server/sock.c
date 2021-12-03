@@ -137,6 +137,24 @@ struct poll_req
     } sockets[1];
 };
 
+static struct list select_list = LIST_INIT( select_list );
+
+struct select_req
+{
+    struct list entry;
+    struct async *async;
+    struct iosb *iosb;
+    struct timeout_user *timeout;
+    unsigned int count;
+    struct afd_select_params *out_params;
+    struct
+    {
+        struct sock *sock;
+        obj_handle_t handle;
+        int flags;
+    } sockets[1];
+};
+
 struct accept_req
 {
     struct list entry;
@@ -198,6 +216,7 @@ struct sock
     struct async_queue  write_q;     /* queue for asynchronous writes */
     struct async_queue  ifchange_q;  /* queue for interface change notifications */
     struct async_queue  accept_q;    /* queue for asynchronous accepts */
+    struct async_queue  select_q;    /* queue for asynchronous se */
     struct async_queue  connect_q;   /* queue for asynchronous connects */
     struct async_queue  poll_q;      /* queue for asynchronous polls */
     struct object      *ifchange_obj; /* the interface change notification object */
@@ -731,6 +750,101 @@ static void complete_async_accept_recv( struct accept_req *req )
     assert( req->recv_len );
 
     fill_accept_output( req );
+}
+
+static void free_select_req( struct select_req *req )
+{
+    if (req->timeout) remove_timeout_user( req->timeout );
+
+    release_object( req->async );
+    release_object( req->iosb );
+    list_remove( &req->entry );
+    free( req );
+}
+
+static int get_select_flags( struct sock *sock, int event )
+{
+    int flags = 0;
+
+    /* A connection-mode socket which has never been connected does not return
+     * write or hangup events, but Linux reports POLLOUT | POLLHUP. */
+    if (sock->type == WS_SOCK_STREAM && !(sock->state & (FD_CONNECT | FD_WINE_CONNECTED | FD_WINE_LISTENING)))
+        event &= ~(POLLOUT | POLLHUP);
+
+    if (event & POLLIN)
+    {
+        if (sock->state & FD_WINE_LISTENING)
+            flags |= AFD_SELECT_ACCEPT;
+        else
+            flags |= AFD_SELECT_RDNORM;
+    }
+    if (event & POLLPRI)
+        flags |= AFD_SELECT_RDBAND;
+    if (event & POLLOUT)
+        flags |= AFD_SELECT_WRNORM;
+    if (sock->state & FD_WINE_CONNECTED)
+        flags |= AFD_SELECT_WRBAND;
+    if (event & POLLHUP)
+        flags |= AFD_SELECT_HUP;
+    if (event & POLLERR)
+        flags |= AFD_SELECT_ERR;
+
+    return flags;
+}
+
+static void complete_async_selects( struct sock *sock, int event, int error )
+{
+    int flags = get_select_flags( sock, event );
+    struct select_req *req, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( req, next, &select_list, struct select_req, entry )
+    {
+        struct iosb *iosb = req->iosb;
+        unsigned int i;
+
+        if (iosb->status != STATUS_PENDING)
+            continue;
+
+        for (i = 0; i < req->count; ++i)
+        {
+            if (req->sockets[i].sock == sock && (req->sockets[i].flags & flags))
+            {
+                data_size_t out_size = offsetof( struct afd_select_params, sockets[1] );
+                struct afd_select_params *params = req->out_params;
+
+                if (debug_level)
+                    fprintf( stderr, "completing select for socket %p, wanted %#x got %#x\n",
+                             sock, req->sockets[i].flags, flags );
+
+                params->count = 1;
+                params->sockets[0].socket = req->sockets[i].handle;
+                params->sockets[0].flags = req->sockets[i].flags & flags;
+                params->sockets[0].status = sock_get_ntstatus( error );
+
+                iosb->status = STATUS_SUCCESS;
+                iosb->out_data = params;
+                iosb->out_size = out_size;
+                iosb->result = out_size;
+                async_terminate( req->async, STATUS_ALERTED );
+                break;
+            }
+        }
+    }
+}
+
+static void async_select_timeout( void *private )
+{
+    struct select_req *req = private;
+    struct iosb *iosb = async_get_iosb( req->async );
+    data_size_t out_size = offsetof( struct afd_select_params, sockets[0] );
+
+    req->timeout = NULL;
+    iosb->status = STATUS_TIMEOUT;
+    iosb->out_data = req->out_params;
+    iosb->out_size = out_size;
+    iosb->result = out_size;
+    release_object( iosb );
+    async_terminate( req->async, STATUS_ALERTED );
 }
 
 static void free_connect_req( void *private )
@@ -1283,6 +1397,21 @@ static void sock_queue_async( struct fd *fd, struct async *async, int type, int 
 static void sock_reselect_async( struct fd *fd, struct async_queue *queue )
 {
     struct sock *sock = get_fd_user( fd );
+    struct accept_req *accept_req, *accept_next;
+    struct select_req *select_req, *select_next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( select_req, select_next, &select_list, struct select_req, entry )
+    {
+        struct iosb *iosb = async_get_iosb( select_req->async );
+        if (iosb->status != STATUS_PENDING)
+            free_select_req( select_req );
+        release_object( iosb );
+    }
+    LIST_FOR_EACH_ENTRY_SAFE( accept_req, accept_next, &sock->accept_list, struct accept_req, entry )
+    {
+        if (accept_req->iosb->status != STATUS_PENDING)
+            free_accept_req( accept_req );
+    }
 
     if (sock->wr_shutdown_pending && list_empty( &sock->write_q.queue ))
     {
@@ -1352,11 +1481,56 @@ static int sock_close_handle( struct object *obj, struct process *process, obj_h
 
 static void sock_destroy( struct object *obj )
 {
+    struct accept_req *accept_req, *accept_next;
     struct sock *sock = (struct sock *)obj;
+    struct list *ptr;
 
     assert( obj->ops == &sock_ops );
 
     /* FIXME: special socket shutdown stuff? */
+
+    LIST_FOR_EACH_ENTRY_SAFE( accept_req, accept_next, &sock->accept_list, struct accept_req, entry )
+    async_terminate( accept_req->async, STATUS_CANCELLED );
+
+    /* LIST_FOR_EACH_ENTRY_SAFE isn't enough here, because terminating one async
+     * can cause other elements to be removed from the list. */
+
+    ptr = list_head( &select_list );
+    while (ptr)
+    {
+        struct select_req *req = LIST_ENTRY( ptr, struct select_req, entry );
+        struct iosb *iosb = req->iosb;
+        unsigned int i;
+
+        ptr = list_next( &select_list, ptr );
+
+        if (iosb->status != STATUS_PENDING)
+            continue;
+
+        for (i = 0; i < req->count; ++i)
+        {
+            if (req->sockets[i].sock == sock)
+            {
+                data_size_t out_size = offsetof( struct afd_select_params, sockets[1] );
+                struct afd_select_params *params = req->out_params;
+
+                params->count = 1;
+                params->sockets[0].socket = req->sockets[i].handle;
+                params->sockets[0].flags = AFD_SELECT_CLOSE;
+                params->sockets[0].status = 0;
+
+                iosb->status = STATUS_SUCCESS;
+                iosb->out_data = params;
+                iosb->out_size = out_size;
+                iosb->result = out_size;
+                async_terminate( req->async, STATUS_ALERTED );
+
+                /* restart iteration */
+                ptr = list_head( &select_list );
+                break;
+            }
+        }
+    }
 
     if ( sock->deferred )
         release_object( sock->deferred );
@@ -1369,6 +1543,7 @@ static void sock_destroy( struct object *obj )
     free_async_queue( &sock->accept_q );
     free_async_queue( &sock->connect_q );
     free_async_queue( &sock->poll_q );
+    free_async_queue( &sock->select_q );
     if (sock->event) release_object( sock->event );
     if (sock->fd)
     {
@@ -1420,6 +1595,7 @@ static struct sock *create_socket(void)
     init_async_queue( &sock->accept_q );
     init_async_queue( &sock->connect_q );
     init_async_queue( &sock->poll_q );
+    init_async_queue( &sock->select_q );
     memset( sock->errors, 0, sizeof(sock->errors) );
     list_init( &sock->accept_list );
     return sock;
@@ -2048,7 +2224,8 @@ static int sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
     assert( sock->obj.ops == &sock_ops );
 
-    if (code != IOCTL_AFD_WINE_CREATE && (unix_fd = get_unix_fd( fd )) < 0) return 0;
+    if (code != IOCTL_AFD_SELECT && code != IOCTL_AFD_WINE_CREATE && (unix_fd = get_unix_fd( fd )) < 0) return 0;
+    clear_error();
 
     switch(code)
     {
@@ -2806,6 +2983,121 @@ static int sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
 
         sock->sndtimeo = sndtimeo;
         return 0;
+    }
+
+        case IOCTL_AFD_SELECT:
+    {
+        const struct afd_select_params *params = get_req_data();
+        struct afd_select_params *out_params;
+        struct select_req *req;
+        int i;
+
+        if (get_req_data_size() < sizeof(*params) ||
+            get_req_data_size() < offsetof( struct afd_select_params, sockets[params->count] ) ||
+            get_reply_max_size() < get_req_data_size())
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return 0;
+        }
+
+        if (!(out_params = mem_alloc( offsetof( struct afd_select_params, sockets[params->count] ) )))
+            return 0;
+        memcpy( out_params, params, offsetof( struct afd_select_params, sockets[params->count] ) );
+        out_params->count = 0;
+
+        if (!(req = mem_alloc( offsetof( struct select_req, sockets[params->count] ) )))
+        {
+            free( out_params );
+            return 0;
+        }
+
+        for (i = 0; i < params->count; ++i)
+        {
+            req->sockets[i].sock = (struct sock *)get_handle_obj( current->process,
+                                                                  params->sockets[i].socket, 0, &sock_ops );
+
+            if (!req->sockets[i].sock)
+            {
+                free( req );
+                free( out_params );
+                return 0;
+            }
+            /* Do not hold a reference to the socket, as this will cause a
+             * circular reference and prevent the socket from terminating its
+             * asyncs on close. This will not result in a use-after-free, as
+             * the asyncs will be terminated when the socket is destroyed. */
+            release_object( req->sockets[i].sock );
+            req->sockets[i].handle = params->sockets[i].socket;
+            req->sockets[i].flags = params->sockets[i].flags;
+        }
+        req->count = params->count;
+
+        for (i = 0; i < req->count; ++i)
+        {
+            struct pollfd pollfd;
+            int flags;
+
+            // fixme zf: consider if there is a better way of doing this
+            pollfd.fd = get_unix_fd( req->sockets[i].sock->fd );
+            pollfd.events = POLLIN | POLLPRI | POLLOUT | POLLWRBAND;
+            if (poll( &pollfd, 1, 0 ) < 0)
+            {
+                set_error( sock_get_ntstatus( errno ) );
+                free( req );
+                free( out_params );
+                return 0;
+            }
+
+            // fixme zf: it would also really be nice not to duplicate this logic...
+            if ((req->sockets[i].flags & AFD_SELECT_HUP) && (pollfd.revents & POLLIN) &&
+                req->sockets[i].sock->type == WS_SOCK_STREAM)
+            {
+                char dummy;
+
+                if (!recv( get_unix_fd( req->sockets[i].sock->fd ), &dummy, 1, MSG_PEEK ))
+                {
+                    pollfd.revents &= ~POLLIN;
+                    pollfd.revents |= POLLHUP;
+                }
+            }
+
+            // fixme zf: it really *should* be possible to write a helper here
+            flags = get_select_flags( req->sockets[i].sock, pollfd.revents );
+            if (flags & req->sockets[i].flags)
+            {
+                out_params->sockets[out_params->count].socket = req->sockets[i].handle;
+                out_params->sockets[out_params->count].flags = flags & req->sockets[i].flags;
+                out_params->sockets[out_params->count].status = sock_get_ntstatus( sock_error( req->sockets[i].sock->fd ) );
+                ++out_params->count;
+            }
+        }
+
+        if (out_params->count || !params->timeout)
+        {
+            set_reply_data_ptr( out_params, offsetof( struct afd_select_params, sockets[out_params->count] ) );
+            free( req );
+            return 1;
+        }
+
+        req->out_params = out_params;
+        req->timeout = NULL;
+
+        if (params->timeout != TIMEOUT_INFINITE &&
+            !(req->timeout = add_timeout_user( params->timeout, async_select_timeout, req )))
+        {
+            free( req );
+            free( out_params );
+            return 0;
+        }
+
+        req->async = (struct async *)grab_object( async );
+        req->iosb = async_get_iosb( async );
+        list_add_tail( &select_list, &req->entry );
+        queue_async( &sock->select_q, async );
+        for (i = 0; i < req->count; ++i)
+            sock_reselect( req->sockets[i].sock );
+        set_error( STATUS_PENDING );
+        return 1;
     }
 
     default:

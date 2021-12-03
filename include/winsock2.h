@@ -328,6 +328,9 @@ extern "C" {
 #define WS_POLLOUT                 (WS_POLLWRNORM)
 #endif
 
+#define FD_WINE_LISTENING          0x10000000
+#define FD_WINE_CONNECTED          0x40000000
+
 /* Constants for WSAIoctl() */
 #ifdef USE_WS_PREFIX
 #define WS_IOC_UNIX                0x00000000
