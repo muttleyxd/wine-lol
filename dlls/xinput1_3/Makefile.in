@@ -1,0 +1,10 @@
+MODULE    = xinput1_3.dll
+IMPORTLIB = xinput
+DELAYIMPORTS = hid setupapi
+
+EXTRADLLFLAGS = -mno-cygwin
+
+C_SRCS = \
+	main.c
+
+RC_SRCS = version.rc

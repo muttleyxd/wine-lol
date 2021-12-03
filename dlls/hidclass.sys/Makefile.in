@@ -1,0 +1,10 @@
+MODULE    = hidclass.sys
+IMPORTLIB = hidclass
+IMPORTS   = hal ntoskrnl user32
+
+EXTRADLLFLAGS = -mno-cygwin
+
+C_SRCS = \
+	descriptor.c \
+	device.c \
+	pnp.c

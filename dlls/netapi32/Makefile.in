@@ -1,0 +1,18 @@
+EXTRADEFS = -D_SVRAPI_
+MODULE    = netapi32.dll
+IMPORTLIB = netapi32
+IMPORTS   = rpcrt4 iphlpapi ws2_32 advapi32 dnsapi
+EXTRALIBS = -Wl,--subsystem,unixlib
+
+EXTRADLLFLAGS = -mno-cygwin
+
+C_SRCS = \
+	nbcmdqueue.c \
+	nbnamecache.c \
+	nbt.c \
+	netapi32.c \
+	netbios.c \
+	unixlib.c
+
+IDL_SRCS = \
+	atsvc.idl
